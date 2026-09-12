@@ -1,0 +1,189 @@
+#include <virtio.h>
+#include <pmm.h>
+
+
+#include <stdint.h>
+#include <kstdio.h>
+
+
+#define VIRTIO0_BASE ((volatile uint32_t *) 0x0A000000)
+
+/* Offsets dos Registradores Virtio (em words / 4 bytes) */
+#define VIRTIO_MAGIC                0x000 // 0x000 bytes
+#define VIRTIO_VERSION              0x001 // 0x004 bytes
+#define VIRTIO_DEVICE_ID            0x002 // 0x008 bytes
+#define VIRTIO_STATUS               0x01C // 0x070 bytes
+#define VIRTIO_QUEUE_SEL            0x00C // 0x030 bytes
+#define VIRTIO_QUEUE_NUM_MAX        0x00D // 0x034 bytes
+#define VIRTIO_QUEUE_NUM            0x00E // 0x038 bytes
+#define VIRTIO_QUEUE_READY          0x011 // 0x044 bytes
+#define VIRTIO_INTERRUPT_STATUS     0x018 // 0x060 bytes P.S: na documentação oficial esse valor esta como 0x60 por algum motivo
+#define VIRTIO_INTERRUPT_ACK        0x019 // 0x64 bytes
+#define VIRTIO_QUEUE_DESC_LO        0x020 // 0x080 bytes
+#define VIRTIO_QUEUE_DESC_HI        0x021 // 0x084 bytes
+#define VIRTIO_QUEUE_DRV_LO         0x024 // 0x090 bytes
+#define VIRTIO_QUEUE_DRV_HI         0x025 // 0x094 bytes
+#define VIRTIO_QUEUE_DEV_LO         0x028 // 0x0A0 bytes
+#define VIRTIO_QUEUE_DEV_HI         0x029 // 0x0A4 bytes
+
+
+/*Flags de Status do Virtio */
+#define VIRTIO_STATUS_ACKNOWLEDGE 1
+#define VIRTIO_STATUS_DRIVER      2
+#define VIRTIO_STATUS_FEATURES_OK 8
+#define VIRTIO_STATUS_DRIVER_OK   4
+#define VIRTIO_STATUS_FAILED      128
+
+//IRQ
+#define VIRTIO_NET_IRQ            48
+
+
+/* Estruturas da Virtqueue */
+struct virtq_desc {
+    uint64_t addr;
+    uint32_t len;
+    uint16_t flags;
+    uint16_t next;
+} __attribute__((packed));
+
+struct virtq_avail {
+    uint16_t flags;
+    uint16_t idx;
+    uint16_t ring[];
+} __attribute__((packed));
+
+struct virtq_used_elem {
+    uint32_t id;
+    uint32_t len;
+} __attribute__((packed));
+
+struct virtq_used {
+    uint16_t flags;
+    uint16_t idx;
+    struct virtq_used_elem ring[];
+} __attribute__((packed));
+
+
+/*
+Função interna para tratar a interrupção vinda da placa de rede.
+*/
+void virtio_net_irq_handler(void) {
+
+    volatile uint32_t *mmio = (volatile uint32_t *) 0x0A000000;
+
+    //Lê o registrador INTERRUPT_STATUS
+    if(mmio[VIRTIO_INTERRUPT_STATUS] == 1)
+        kputs(">>> PACOTE DE REDE RECEBIDO<<<\n");
+    
+    // Ler o anel USED da virqueue 
+    // TODO: processar_pacote_rx();
+
+    // Avisar a placa Virtio que a interrupção foi tratada escrevendo no registrador INTERRUPT_ACK.
+    mmio[VIRTIO_INTERRUPT_ACK] = 1;
+}
+
+
+/*
+Função interna para fazer configuração de uma fila
+*/
+void virtqueue_config(volatile uint32_t *mmio, int32_t num){
+
+    mmio[VIRTIO_QUEUE_SEL] = num; //Seleciona a fila
+    uint32_t queue_max = mmio[VIRTIO_QUEUE_NUM_MAX];
+    if (queue_max == 0) {
+        // Fila nao suportada
+        return;
+    }
+    uint32_t queue_size = (queue_max > 128) ? 128 : queue_max;
+    mmio[VIRTIO_QUEUE_NUM] = queue_size;
+
+    //Alocar as memorias da virtqueue
+    uintptr_t desc_addr = (uintptr_t) pmm_alloc_block();
+    uintptr_t avail_addr = (uintptr_t) pmm_alloc_block();
+    uintptr_t used_addr = (uintptr_t) pmm_alloc_block();
+
+    // Informar os enderecos ao hardware (divididos em Low e High 32-bits) 
+    mmio[VIRTIO_QUEUE_DESC_LO] = (uint32_t) desc_addr;
+    mmio[VIRTIO_QUEUE_DESC_HI] = (uint32_t) (desc_addr >> 32);
+
+    mmio[VIRTIO_QUEUE_DRV_LO]  = (uint32_t) avail_addr;
+    mmio[VIRTIO_QUEUE_DRV_HI]  = (uint32_t) (avail_addr >> 32);
+
+    mmio[VIRTIO_QUEUE_DEV_LO]  = (uint32_t) used_addr;
+    mmio[VIRTIO_QUEUE_DEV_HI]  = (uint32_t) (used_addr >> 32);
+
+    //Habilita a fila
+    mmio[VIRTIO_QUEUE_READY] = 1;
+}
+
+
+void virtio_net_init(void){
+    volatile uint32_t *mmio = VIRTIO0_BASE; // Como dito na documentação, no futuro isso deve ser achado usando o device tree blob
+
+    //Verificar Magic value para checar se realmente é o endereço do virtio
+
+    if (mmio[VIRTIO_MAGIC] != 0x74726976){ // "virt" em ASCI
+        kputs("Nenhum dispositivo Virtio encontrado.\n");
+        return;
+    }
+    //Vereficar versão e se é reconhecido como uma network card
+    if (mmio[VIRTIO_VERSION] != 2){ 
+        kputs("Versão não suportada.\n");
+        return;
+    }
+    
+    if (mmio[VIRTIO_DEVICE_ID] != 1){  // 1 = network card
+        kputs("Dispositivo nao e uma placa de rede.\n");
+        return;
+    }
+
+
+    /* 
+    O processo de inicialização do virtio segue uma serie especifica de passos para avisar o driver
+    de que ele vai ser usado como dispositivo de rede, os passos em sequência são:
+
+    1.Virtio_status = 0 (Reinicio)
+    2.Virtio_status = 1 (Acknowledge: O kernel reconhece o dispositivo virtio)
+    3.virtio_status = 2 (Driver: O kernel diz que sabe como controlar o dispositivo)
+    4. (O driver diz as configurações que vai usar para os pacotes, pulado neste kernel)
+    
+
+
+    O driver então verifica se o status é 8 indicando que o dispositivo aceitou as configurções.
+    caso contrario, lança erro
+
+    Depois disso, as virtqueues são configuradas
+    neste programa, serão configuradas a queue 0 como recebimento RX e queue 1 como transmissão
+
+    por sim, virtio_status recebe 4, onde o driver diz que terminou a configuração
+    */
+
+    
+    mmio[VIRTIO_STATUS] = 0;
+    mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_ACKNOWLEDGE;
+    mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_DRIVER;
+    mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FEATURES_OK;
+
+    if (!(mmio[VIRTIO_STATUS] & VIRTIO_STATUS_FEATURES_OK)) {
+        kputs("Handshake com dispositivo falhou.\n");
+        mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FAILED;
+        return;
+    }
+
+    //Configuração da virtqueue
+    virtqueue_config(mmio, 0); //Fila 0: RX
+    virtqueue_config(mmio, 1); //Fila 1: TX
+
+    mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_DRIVER_OK;
+
+
+    //registrar função de interrupção do IRQ
+    if (register_interrupt_handler(VIRTIO_NET_IRQ, virtio_net_irq_handler) == 0) {
+        kputs("Driver Virtio registrado no GIC com sucesso!\n");
+    } else {
+        kputs("Erro ao registrar IRQ do Virtio.\n");
+    }
+
+    //habilitar a interrupção no hardware do GIC
+    gic_enable_interrupt(VIRTIO_NET_IRQ);
+}
