@@ -4,6 +4,8 @@
 
 
 
+
+
 // Funções de rede
 void virtio_net_init(void);
 

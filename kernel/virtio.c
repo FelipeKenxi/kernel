@@ -1,12 +1,11 @@
 #include <virtio.h>
 #include <pmm.h>
+#include <types.h>
+#include <interrupts_handler.h>
+#include <stdio.h>
 
 
-#include <stdint.h>
-#include <kstdio.h>
-
-
-#define VIRTIO0_BASE ((volatile uint32_t *) 0x0A000000)
+#define VIRTIO0_BASE ((uint32_t *) 0x0A000000)
 
 /* Offsets dos Registradores Virtio (em words / 4 bytes) */
 #define VIRTIO_MAGIC                0x000 // 0x000 bytes
@@ -85,7 +84,7 @@ Função interna para tratar a interrupção vinda da placa de rede.
 */
 void virtio_net_irq_handler(void) {
 
-    volatile uint32_t *mmio = VIRTIO0_BASE;
+    uint32_t *mmio = VIRTIO0_BASE;
 
     //Lê o registrador INTERRUPT_STATUS
     if(mmio[VIRTIO_INTERRUPT_STATUS] & 1){
@@ -101,7 +100,7 @@ void virtio_net_irq_handler(void) {
             
             char *buffer_recebido = (char *)(uintptr_t) rx->desc[desc_id].addr;
 
-            kputs(">>> PACOTE DE REDE RECEBIDO<<<\n");
+            printf(">>> PACOTE DE REDE RECEBIDO<<<\n");
 
             //O virtio usa os 12 primeiro bytes do buffer para um cabeçalho proprio antes do da ethernet
             char *frame_ethernet = buffer_recebido + 12;
@@ -130,7 +129,7 @@ void virtio_net_irq_handler(void) {
 /*
 Função interna para fazer configuração de uma fila
 */
-void virtqueue_config(volatile uint32_t *mmio, int32_t num){
+void virtqueue_config(uint32_t *mmio, int32_t num){
 
     mmio[VIRTIO_QUEUE_SEL] = num; //Seleciona a fila
     uint32_t queue_max = mmio[VIRTIO_QUEUE_NUM_MAX];
@@ -188,22 +187,22 @@ void virtqueue_config(volatile uint32_t *mmio, int32_t num){
 
 
 void virtio_net_init(void){
-    volatile uint32_t *mmio = VIRTIO0_BASE; // Como dito na documentação, no futuro isso deve ser achado usando o device tree blob
+    uint32_t *mmio = VIRTIO0_BASE; // Como dito na documentação, no futuro isso deve ser achado usando o device tree blob
 
     //Verificar Magic value para checar se realmente é o endereço do virtio
 
     if (mmio[VIRTIO_MAGIC] != 0x74726976){ // "virt" em ASCI
-        kputs("Nenhum dispositivo Virtio encontrado.\n");
+        printf("Nenhum dispositivo Virtio encontrado.\n");
         return;
     }
     //Vereficar versão e se é reconhecido como uma network card
     if (mmio[VIRTIO_VERSION] != 2){ 
-        kputs("Versão não suportada.\n");
+        printf("Versão não suportada.\n");
         return;
     }
     
     if (mmio[VIRTIO_DEVICE_ID] != 1){  // 1 = network card
-        kputs("Dispositivo nao e uma placa de rede.\n");
+        printf("Dispositivo nao e uma placa de rede.\n");
         return;
     }
 
@@ -235,7 +234,7 @@ void virtio_net_init(void){
     mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FEATURES_OK;
 
     if (!(mmio[VIRTIO_STATUS] & VIRTIO_STATUS_FEATURES_OK)) {
-        kputs("Handshake com dispositivo falhou.\n");
+        printf("Handshake com dispositivo falhou.\n");
         mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FAILED;
         return;
     }
@@ -249,9 +248,9 @@ void virtio_net_init(void){
 
     //registrar função de interrupção do IRQ
     if (register_interrupt_handler(VIRTIO_NET_IRQ, virtio_net_irq_handler) == 0) {
-        kputs("Driver Virtio registrado no GIC com sucesso!\n");
+        printf("Driver Virtio registrado no GIC com sucesso!\n");
     } else {
-        kputs("Erro ao registrar IRQ do Virtio.\n");
+        printf("Erro ao registrar IRQ do Virtio.\n");
     }
 
     //habilitar a interrupção no hardware do GIC
