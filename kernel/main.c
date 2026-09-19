@@ -17,6 +17,7 @@ void kmain(void) {
     // Inicialização do GIC e interrupção por timer
     kputs("Configurando GIC e Timer...\n");
     init_gic();
+
     init_timer();
 
     kstdio_init();
@@ -54,10 +55,15 @@ void kmain(void) {
     // FIM DOS TESTES DO GERENCIADOR DE MEMORIA //
 
 
-
     // TESTES DA PLACA DE REDE //
     kputs("Iniciando placa de rede.\n");
-    virtio_net_init();
+    int16_t virtio = virtio_net_init();
+    if(virtio == 1)
+        kputs("Placa de rede iniciada.\n");
+    
+    else
+        kputs("Placa de rede não encontrada, inicie com make run-net!\n");
+    
     // FIM DOS TESTES DA PLACA DE REDE //
 
 
@@ -70,3 +76,5 @@ void kmain(void) {
 
     return;
 }
+
+

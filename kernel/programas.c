@@ -2,6 +2,7 @@
 #include <syscall.h>
 #include <stringutils.h>
 #include <stdio.h>
+#include <virtio.h>
 
 program program_table[] = {
     {"programa1", "Imprime texto de teste várias vezes na tela.", programa1},
@@ -12,6 +13,7 @@ program program_table[] = {
     {"exit", "Desliga o sistema.", prog_exit},
     {"help", "Imprime os comandos do sistema.", prog_help},
     {"evento", "Imprime o visual de evento do UFSKernel.", prog_evento},
+    {"rede", "teste de rede, mande um pacote para a porta 5555.", socket_listen},
     {0, 0, 0}
 };
 
@@ -26,6 +28,43 @@ void prog_init_idle(int argc, char** argv) {
         // TODO: wait for interrupt, por enquanto CPU fica em 100% aqui
     }
 }
+
+
+void socket_listen(int argc, char** argv){
+    (void)argc; (void)argv;
+
+    int s = socket(5555);
+    
+
+    char m[65];
+
+    m[0] = 'o';
+    m[1] = 'i';
+    m[2] = '.';
+    m[3] = '\0';
+
+
+    volatile unsigned bytes_lidos = 0;
+
+    bytes_lidos = recv(s, m, 40);
+
+    if(bytes_lidos > 0){
+
+            printf("Chegou algo.\n");
+
+            m[bytes_lidos] = 0;
+            puts(m);
+            
+    }
+    else
+        printf("Chegou nada.\n");
+
+    exit();
+}
+
+
+
+
 
 void programa1(int argc, char** argv) {
     (void)argc; (void)argv;

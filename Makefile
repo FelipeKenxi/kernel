@@ -60,4 +60,11 @@ run: all
 debug: all
 	@qemu-system-arm -M virt -cpu cortex-a15 -nographic -kernel $(TARGET) -s -S
 
-.PHONY: all clean run debug
+run-net: all
+	@qemu-system-arm -M virt -cpu cortex-a15 -nographic -kernel $(TARGET) -netdev user,id=net0,hostfwd=udp::5555-:5555 -device virtio-net-device,netdev=net0 -object filter-dump,id=net0,netdev=net0,file=qemu-trafego.pcap
+
+debug-net: all
+	@qemu-system-arm -M virt -cpu cortex-a15 -nographic -kernel $(TARGET) -netdev user,id=net0,hostfwd=udp::5555-:5555 -device virtio-net-device,netdev=net0 -s -S
+
+
+.PHONY: all clean run debug run-net debug-net

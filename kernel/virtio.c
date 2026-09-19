@@ -1,30 +1,34 @@
-#include <virtio.h>
+#include "virtio.h"
 #include <pmm.h>
 #include <types.h>
 #include <interrupts_handler.h>
+#include <VMM.h>
+#include <process.h>
+#include <scheduler.h>
 #include <stdio.h>
 
 
-#define VIRTIO0_BASE ((uint32_t *) 0x0A000000)
+volatile struct socket tabela_sockets[MAX_SOCKETS];
+
+
+
+#define VIRTIO0_BASE ((uint32_t *) 0x0A003e00)
 
 /* Offsets dos Registradores Virtio (em words / 4 bytes) */
 #define VIRTIO_MAGIC                0x000 // 0x000 bytes
 #define VIRTIO_VERSION              0x001 // 0x004 bytes
 #define VIRTIO_DEVICE_ID            0x002 // 0x008 bytes
 #define VIRTIO_STATUS               0x01C // 0x070 bytes
+#define VIRTIO_GUEST_PAGE_SIZE      0x00A // 0x028 bytes
 #define VIRTIO_QUEUE_SEL            0x00C // 0x030 bytes
 #define VIRTIO_QUEUE_NUM_MAX        0x00D // 0x034 bytes
 #define VIRTIO_QUEUE_NUM            0x00E // 0x038 bytes
+#define VIRTIO_QUEUE_ALIGN          0x00F // 0x03C bytes
+#define VIRTIO_QUEUE_PFN            0x010 // 0x040 bytes
 #define VIRTIO_QUEUE_READY          0x011 // 0x044 bytes
 #define VIRTIO_QUEUE_NOTIFY         0x014 // 0x050 bytes
 #define VIRTIO_INTERRUPT_STATUS     0x018 // 0x060 bytes P.S: na documentação oficial esse valor esta como 0x60 por algum motivo
-#define VIRTIO_INTERRUPT_ACK        0x019 // 0x64 bytes
-#define VIRTIO_QUEUE_DESC_LO        0x020 // 0x080 bytes
-#define VIRTIO_QUEUE_DESC_HI        0x021 // 0x084 bytes
-#define VIRTIO_QUEUE_DRV_LO         0x024 // 0x090 bytes
-#define VIRTIO_QUEUE_DRV_HI         0x025 // 0x094 bytes
-#define VIRTIO_QUEUE_DEV_LO         0x028 // 0x0A0 bytes
-#define VIRTIO_QUEUE_DEV_HI         0x029 // 0x0A4 bytes
+#define VIRTIO_INTERRUPT_ACK        0x019 // 0x064 bytes
 
 
 /*Flags de Status do Virtio */
@@ -79,45 +83,127 @@ struct virtqueue_info {
 struct virtqueue_info virtqueues[2];
 
 
+void virtio_send_arp_reply(uint8_t *target_mac, uint8_t *target_ip) {
+    struct virtqueue_info *tx = &virtqueues[1];
+    uint32_t desc_id = tx->avail_idx % VIRTQ_SIZE;
+    
+    char *tx_buf = (char *) pmm_alloc_block();
+    
+    for(int i = 0; i < 10; i++) tx_buf[i] = 0;
+    
+    for(int i = 0; i < 6; i++) tx_buf[10 + i] = target_mac[i];
+    
+  
+    uint8_t my_mac[6] = {0x52, 0x54, 0x00, 0x12, 0x34, 0x56};
+    for(int i = 0; i < 6; i++) tx_buf[16 + i] = my_mac[i];
+    
+    //ARP (0x0806)
+    tx_buf[22] = 0x08; tx_buf[23] = 0x06;
+    
+    // 3. Monta o Payload ARP (28 bytes) no offset 24
+    struct arp_hdr *arp_reply = (struct arp_hdr *)(tx_buf + 24);
+    
+    arp_reply->hw_type    = 0x0100; // 1 (Ethernet) em Big Endian
+    arp_reply->proto_type = 0x0008; // 0x0800 (IPv4) em Big Endian
+    arp_reply->hw_len     = 6;
+    arp_reply->proto_len  = 4;
+    arp_reply->opcode     = 0x0200; // 2 (Reply) em Big Endian
+    
+    //Sender
+    for(int i = 0; i < 6; i++) arp_reply->sender_mac[i] = my_mac[i];
+    uint8_t my_ip[4] = {10, 0, 2, 15}; // IP padrão do QEMU Guest
+    for(int i = 0; i < 4; i++) arp_reply->sender_ip[i] = my_ip[i];
+    
+    // Target
+    for(int i = 0; i < 6; i++) arp_reply->target_mac[i] = target_mac[i];
+    for(int i = 0; i < 4; i++) arp_reply->target_ip[i] = target_ip[i];
+    
+
+    tx->desc[desc_id].addr = (uint64_t)(uintptr_t)tx_buf;
+    tx->desc[desc_id].len = 52;
+    tx->desc[desc_id].flags = 0; // Read-Only para o hardware
+    tx->desc[desc_id].next = 0;
+    
+    tx->avail->ring[desc_id] = desc_id;
+    tx->avail_idx++;
+    tx->avail->idx = tx->avail_idx;
+    
+    volatile uint32_t *mmio = VIRTIO0_BASE;
+    mmio[VIRTIO_QUEUE_NOTIFY] = 1; // Avisa a Fila 1 (TX)
+}
+
 /*
 Função interna para tratar a interrupção vinda da placa de rede.
 */
 void virtio_net_irq_handler(void) {
 
-    uint32_t *mmio = VIRTIO0_BASE;
+    
+
+    volatile uint32_t *mmio = VIRTIO0_BASE;
 
     //Lê o registrador INTERRUPT_STATUS
     if(mmio[VIRTIO_INTERRUPT_STATUS] & 1){
         struct virtqueue_info *rx = &virtqueues[0];
 
         while(rx->last_used_idx != rx->used->idx){
+
+
             uint16_t used_ring_index = rx->last_used_idx % VIRTQ_SIZE;
 
             struct virtq_used_elem *elem = &rx->used->ring[used_ring_index];
 
-            uint32_t desc_id = elem->id;  
-            uint32_t pkt_len = elem->len;
+            uint32_t desc_id = elem->id;
             
             char *buffer_recebido = (char *)(uintptr_t) rx->desc[desc_id].addr;
+            struct eth_hdr *eth = (struct eth_hdr *) (buffer_recebido + sizeof(struct virtio_net_hdr));
 
-            printf(">>> PACOTE DE REDE RECEBIDO<<<\n");
+            uint16_t eth_type = ntohs(eth->ethertype);
 
-            //O virtio usa os 12 primeiro bytes do buffer para um cabeçalho proprio antes do da ethernet
-            char *frame_ethernet = buffer_recebido + 12;
+            if (eth_type == 0x0806){ // ARP
+                tabela_sockets[0].rx_tamanho = 3;
+                tabela_sockets[0].rx_buffer[0] = 'A';
+                tabela_sockets[0].rx_buffer[1] = 'R';
+                tabela_sockets[0].rx_buffer[3] = 'P';
+            }
+            else if(eth_type == 0x0800){
+                struct ipv4_hdr *ip = (struct ipv4_hdr *) ((uint8_t*)eth + sizeof(struct eth_hdr));
 
-            //TODO: processar pacote
+                if(ip->protocol){ //UDP
+                    int32_t ip_hdr_len = (ip->ihl_version & 0x0F) * 4;
+                    struct udp_hdr *udp = (struct udp_hdr *) ((uint8_t*)ip + ip_hdr_len);
+
+                    //uint16_t porta_destino = ntohs(udp->dest_port);
+                    uint8_t *payload = (uint8_t*)udp + sizeof(struct udp_hdr);
+                    int32_t payload_len = ntohs(udp->len) - sizeof(struct udp_hdr);
+
+                    for (int32_t i = 0; i < MAX_SOCKETS; i++){
+                        if(tabela_sockets[i].em_uso){
+                            for (int32_t j = 0; j < payload_len; j++) tabela_sockets[i].rx_buffer[j] = payload[j];
+                            tabela_sockets[i].rx_tamanho = payload_len;
+
+                            //acordar o processo
+                            if (tabela_sockets[i].processo_bloqueado) {
+                                tabela_sockets[i].processo_bloqueado->state = READY;
+                                tabela_sockets[i].processo_bloqueado = NULL;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
 
             uint16_t novo_avail_idx = rx->avail_idx % VIRTQ_SIZE;
             rx->avail->ring[novo_avail_idx] = desc_id;
             rx->avail_idx++;
-            
+                
             rx->last_used_idx++;
+        
             
         }
 
         rx->avail->idx = rx->avail_idx;
         
-        // Notifica a fila RX (offset 0x050 = Queue Notify)
+
         mmio[VIRTIO_QUEUE_NOTIFY] = 0;    
     }
     
@@ -129,7 +215,7 @@ void virtio_net_irq_handler(void) {
 /*
 Função interna para fazer configuração de uma fila
 */
-void virtqueue_config(uint32_t *mmio, int32_t num){
+void virtqueue_config(volatile uint32_t *mmio, int32_t num){
 
     mmio[VIRTIO_QUEUE_SEL] = num; //Seleciona a fila
     uint32_t queue_max = mmio[VIRTIO_QUEUE_NUM_MAX];
@@ -142,35 +228,41 @@ void virtqueue_config(uint32_t *mmio, int32_t num){
 
     //Alocar as memorias da virtqueue
 
-    virtqueues[num].desc  = (struct virtq_desc *) pmm_alloc_block();
-    virtqueues[num].avail = (struct virtq_avail *) pmm_alloc_block();
-    virtqueues[num].used  = (struct virtq_used *) pmm_alloc_block();
+    mmio[VIRTIO_QUEUE_ALIGN] = 4096;
+
+    
+
+    void *fila_base = pmm_alloc_block();
+    pmm_alloc_block();
+
+    uint8_t *ptr = (uint8_t *)fila_base;
+    for (int i = 0; i < 8192; i++) {
+        ptr[i] = 0; //limpeza
+    }
+
+    virtqueues[num].desc  = (struct virtq_desc *) fila_base;
+    virtqueues[num].avail = (struct virtq_avail *) (fila_base + (queue_size * sizeof(struct virtq_desc)));
+    virtqueues[num].used  = (struct virtq_used *) (fila_base + 4096);
     virtqueues[num].last_used_idx = 0;
     virtqueues[num].avail_idx = 0;
 
-    uintptr_t desc_addr = (uintptr_t) virtqueues[num].desc;
-    uintptr_t avail_addr = (uintptr_t) virtqueues[num].avail;
-    uintptr_t used_addr = (uintptr_t) virtqueues[num].used;
 
-    // Informar os enderecos ao hardware (divididos em Low e High 32-bits) 
-    mmio[VIRTIO_QUEUE_DESC_LO] = (uint32_t) desc_addr;
-    mmio[VIRTIO_QUEUE_DESC_HI] = (uint32_t) (desc_addr >> 32);
+    
 
-    mmio[VIRTIO_QUEUE_DRV_LO]  = (uint32_t) avail_addr;
-    mmio[VIRTIO_QUEUE_DRV_HI]  = (uint32_t) (avail_addr >> 32);
-
-    mmio[VIRTIO_QUEUE_DEV_LO]  = (uint32_t) used_addr;
-    mmio[VIRTIO_QUEUE_DEV_HI]  = (uint32_t) (used_addr >> 32);
-
-
+    uint32_t page_frame_number = (uintptr_t)fila_base / 4096;
+    mmio[VIRTIO_QUEUE_PFN] = page_frame_number;
+    
     if (num == 0) { // Fila RX
-        for (int i = 0; i < queue_size; i++) {
+        for (uint32_t i = 0; i < queue_size; i++) {
             // Aloca um buffer no heap do kernel
-            void *buffer = kmalloc(2048); 
+            void *buffer = pmm_alloc_block();
+            
+
+            
             
             // Configura o descritor apontando para o buffer
             virtqueues[num].desc[i].addr = (uint64_t)(uintptr_t)buffer;
-            virtqueues[num].desc[i].len = 2048;
+            virtqueues[num].desc[i].len = 4096;
             virtqueues[num].desc[i].flags = 2; // VIRTQ_DESC_F_WRITE (Dispositivo pode escrever aqui)
             virtqueues[num].desc[i].next = 0;
             
@@ -179,31 +271,37 @@ void virtqueue_config(uint32_t *mmio, int32_t num){
         }
         // Avisa a placa que disponibilizamos os índices de 0 a queue_size
         virtqueues[num].avail->idx = queue_size;
+        
+        mmio[VIRTIO_QUEUE_NOTIFY] = num;
     }
+    if (num == 1){
+            virtqueues[num].avail->idx = 0;
+    }
+    
 
-    //Habilita a fila
-    mmio[VIRTIO_QUEUE_READY] = 1;
+    
 }
 
 
-void virtio_net_init(void){
-    uint32_t *mmio = VIRTIO0_BASE; // Como dito na documentação, no futuro isso deve ser achado usando o device tree blob
+int16_t virtio_net_init(void){
+
+    volatile uint32_t *mmio = (uint32_t *)0x0A003e00; // Como dito na documentação, no futuro isso deve ser achado usando o device tree blob
 
     //Verificar Magic value para checar se realmente é o endereço do virtio
 
     if (mmio[VIRTIO_MAGIC] != 0x74726976){ // "virt" em ASCI
-        printf("Nenhum dispositivo Virtio encontrado.\n");
-        return;
+        //printf("Nenhum dispositivo Virtio encontrado.\n");
+        return -1;
     }
     //Vereficar versão e se é reconhecido como uma network card
-    if (mmio[VIRTIO_VERSION] != 2){ 
-        printf("Versão não suportada.\n");
-        return;
+    if (mmio[VIRTIO_VERSION] != 1){ 
+        //printf("Versão não suportada.\n");
+        return -1;
     }
     
     if (mmio[VIRTIO_DEVICE_ID] != 1){  // 1 = network card
-        printf("Dispositivo nao e uma placa de rede.\n");
-        return;
+        //printf("Dispositivo nao e uma placa de rede.\n");
+        return -1;
     }
 
 
@@ -224,20 +322,15 @@ void virtio_net_init(void){
     Depois disso, as virtqueues são configuradas
     neste programa, serão configuradas a queue 0 como recebimento RX e queue 1 como transmissão
 
-    por sim, virtio_status recebe 4, onde o driver diz que terminou a configuração
+    por fim, virtio_status recebe 4, onde o driver diz que terminou a configuração
     */
 
     
     mmio[VIRTIO_STATUS] = 0;
     mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_ACKNOWLEDGE;
     mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_DRIVER;
-    mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FEATURES_OK;
 
-    if (!(mmio[VIRTIO_STATUS] & VIRTIO_STATUS_FEATURES_OK)) {
-        printf("Handshake com dispositivo falhou.\n");
-        mmio[VIRTIO_STATUS] |= VIRTIO_STATUS_FAILED;
-        return;
-    }
+    mmio[VIRTIO_GUEST_PAGE_SIZE] = 4096;
 
     //Configuração da virtqueue
     virtqueue_config(mmio, 0); //Fila 0: RX
@@ -248,11 +341,159 @@ void virtio_net_init(void){
 
     //registrar função de interrupção do IRQ
     if (register_interrupt_handler(VIRTIO_NET_IRQ, virtio_net_irq_handler) == 0) {
-        printf("Driver Virtio registrado no GIC com sucesso!\n");
+        //printf("Driver Virtio registrado no GIC com sucesso!\n");
     } else {
-        printf("Erro ao registrar IRQ do Virtio.\n");
+        return 2;
     }
 
     //habilitar a interrupção no hardware do GIC
     gic_enable_interrupt(VIRTIO_NET_IRQ);
+
+
+
+    //Após inicializar a rede, inicializa os sockets como 0
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++)
+        tabela_sockets[i].em_uso = 0;
+
+
+    //ARP para a rede
+    uint8_t mac_broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t meu_ip[4] = {10, 0, 2, 15};
+
+    // Envia o ARP Reply não-solicitado. 
+    // O QEMU vai gravar essa informação na tabela dele.
+    virtio_send_arp_reply(mac_broadcast, meu_ip);
+    
+    return 1;
+}
+
+
+
+
+
+
+
+
+
+
+int32_t sys_socket(uint16_t porta){
+    for (uint32_t i = 0; i < MAX_SOCKETS; i++)
+        if (!tabela_sockets[i].em_uso){
+            tabela_sockets[i].em_uso = 1;
+            tabela_sockets[i].porta_local = porta;
+            tabela_sockets[i].rx_tamanho = 0;
+            tabela_sockets[i].processo_bloqueado = 0;
+            return i; 
+        }
+    return -1;
+}
+
+
+extern struct process *current;
+uint32_t sys_recv(int32_t sock_id, void *buffer_user, uint32_t tam_max){
+
+
+    volatile uint32_t *mmio_interrupt = (VIRTIO0_BASE + 0x060);
+    volatile struct socket *sock = &tabela_sockets[sock_id];
+
+    if (mmio_interrupt[0] & 1){
+        virtio_net_irq_handler();
+    }
+
+    uint32_t bytes = (sock->rx_tamanho < tam_max) ? sock->rx_tamanho : tam_max;
+
+    //seria ideal ter uma rotina de memcpy aqui
+    for(uint32_t i=0; i < bytes; i++) 
+        ((uint8_t*)buffer_user)[i] = sock->rx_buffer[i];
+
+    sock->rx_tamanho = 0;
+
+    return bytes; //retorna quantidade de bytes lidos
+
+    /*
+    
+    volatile struct socket *sock = &tabela_sockets[sock_id];
+    
+    // O socket ouvinte nao tem nenhum pacote ainda
+    //ele sera blockeado
+    
+    while(sock->rx_tamanho == 0){
+            current->state = BLOCKED;
+            current->blocked_by = BT_UART; // Talvez adicionar um BT_NETWORK ?
+            sock->processo_bloqueado = current;
+
+
+            pll_node* pll = pcb_get_node_pid(current->pid);
+            pcb_fall(pll);
+            pcb_elect();
+    }
+    
+
+    uint32_t bytes = (sock->rx_tamanho < tam_max) ? sock->rx_tamanho : tam_max;
+
+    //seria ideal ter uma rotina de memcpy aqui
+    for(uint32_t i=0; i < bytes; i++) 
+        ((uint8_t*)buffer_user)[i] = sock->rx_buffer[i];
+
+    sock->rx_tamanho = 0;
+
+    return bytes; //retorna quantidade de bytes lidos
+    */
+    
+}
+
+
+
+int32_t sys_send(int32_t sock_id, void *buffer_user, uint32_t len) {
+    if (sock_id < 0 || sock_id >= MAX_SOCKETS || !tabela_sockets[sock_id].em_uso) {
+        return -1;
+    }
+
+    struct virtqueue_info *tx = &virtqueues[1];
+    
+    // Pega o próximo descritor livre (simplificado para teste)
+    uint32_t desc_id = tx->avail_idx % VIRTQ_SIZE;
+
+    char *tx_buf = (char *) pmm_alloc_block();
+
+    for(int i = 0; i < 10; i++) tx_buf[i] = 0;
+
+    tx_buf[10] = 0xFF; tx_buf[11] = 0xFF; tx_buf[12] = 0xFF;
+    tx_buf[13] = 0xFF; tx_buf[14] = 0xFF; tx_buf[15] = 0xFF;
+    
+    // MAC Origem: Padrão do QEMU (Offset 16 a 21)
+    tx_buf[16] = 0x52; tx_buf[17] = 0x54; tx_buf[18] = 0x00;
+    tx_buf[19] = 0x12; tx_buf[20] = 0x34; tx_buf[21] = 0x56;
+    
+    // EtherType: IPv4 - 0x0800 (Offset 22 e 23)
+    tx_buf[22] = 0x08;
+    tx_buf[23] = 0x00;
+
+    // 3. Copia a mensagem do usuário LOGO APÓS o cabeçalho Ethernet (Offset 24)
+    char *origem = (char *) buffer_user;
+    for(uint32_t i = 0; i < len; i++) {
+        tx_buf[24 + i] = origem[i];
+    }
+
+    // O tamanho do pacote agora é: 10 (Virtio) + 14 (Ethernet) + Tamanho do Texto
+    
+
+    // 3. Configura o descritor
+    tx->desc[desc_id].addr = (uint64_t)(uintptr_t)tx_buf;
+    tx->desc[desc_id].len = 10 + 14 + len;
+    tx->desc[desc_id].flags = 0; // 0 = Placa apenas LÊ (Read-Only para o dispositivo)
+    tx->desc[desc_id].next = 0;
+
+    // 4. Adiciona ao anel Available
+    tx->avail->ring[desc_id] = desc_id;
+    tx->avail_idx++;
+    
+    // 5. Atualiza o índice visível para a placa (deve ser a última coisa antes do notify)
+    tx->avail->idx = tx->avail_idx;
+
+    // 6. "Chuta" a placa para ela ler os dados
+    volatile uint32_t *mmio = VIRTIO0_BASE;
+    mmio[VIRTIO_QUEUE_NOTIFY] = 1; // Avisa a fila 1 (TX)
+
+    return len;
 }
