@@ -6,6 +6,7 @@
 #include <process.h>
 #include <scheduler.h>
 #include <stdio.h>
+#include <protocol_headers.h>
 
 
 volatile struct socket tabela_sockets[MAX_SOCKETS];
@@ -39,7 +40,10 @@ volatile struct socket tabela_sockets[MAX_SOCKETS];
 #define VIRTIO_STATUS_FAILED      128
 
 //IRQ
-#define VIRTIO_NET_IRQ            48
+#define VIRTIO_NET_IRQ            48 // SPI = IRQ - 32
+
+
+uint8_t virtiommio_on = 0; 
 
 
 /* Estruturas da Virtqueue */
@@ -159,13 +163,8 @@ void virtio_net_irq_handler(void) {
 
             uint16_t eth_type = ntohs(eth->ethertype);
 
-            if (eth_type == 0x0806){ // ARP
-                tabela_sockets[0].rx_tamanho = 3;
-                tabela_sockets[0].rx_buffer[0] = 'A';
-                tabela_sockets[0].rx_buffer[1] = 'R';
-                tabela_sockets[0].rx_buffer[3] = 'P';
-            }
-            else if(eth_type == 0x0800){
+           
+            if(eth_type == 0x0800){
                 struct ipv4_hdr *ip = (struct ipv4_hdr *) ((uint8_t*)eth + sizeof(struct eth_hdr));
 
                 if(ip->protocol){ //UDP
@@ -178,8 +177,8 @@ void virtio_net_irq_handler(void) {
 
                     for (int32_t i = 0; i < MAX_SOCKETS; i++){
                         if(tabela_sockets[i].em_uso){
-                            for (int32_t j = 0; j < payload_len; j++) tabela_sockets[i].rx_buffer[j] = payload[j];
-                            tabela_sockets[i].rx_tamanho = payload_len;
+                            for (int32_t j = tabela_sockets[i].rx_tamanho, k = 0; k < payload_len && j < 4096; j++, k++) tabela_sockets[i].rx_buffer[j] = payload[k];
+                            tabela_sockets[i].rx_tamanho += payload_len;
 
                             //acordar o processo
                             if (tabela_sockets[i].processo_bloqueado) {
@@ -231,7 +230,8 @@ void virtqueue_config(volatile uint32_t *mmio, int32_t num){
     mmio[VIRTIO_QUEUE_ALIGN] = 4096;
 
     
-
+    // Atualmente isso só funciona por sorte de o pmm_alloc_block alocar 2 blocos consecutivos quando
+    // O virtio é iniciado, futuramente isso deve se tornar um kmalloc
     void *fila_base = pmm_alloc_block();
     pmm_alloc_block();
 
@@ -255,6 +255,7 @@ void virtqueue_config(volatile uint32_t *mmio, int32_t num){
     if (num == 0) { // Fila RX
         for (uint32_t i = 0; i < queue_size; i++) {
             // Aloca um buffer no heap do kernel
+            // isso deve se tornar um kmalloc
             void *buffer = pmm_alloc_block();
             
 
@@ -309,15 +310,10 @@ int16_t virtio_net_init(void){
     O processo de inicialização do virtio segue uma serie especifica de passos para avisar o driver
     de que ele vai ser usado como dispositivo de rede, os passos em sequência são:
 
-    1.Virtio_status = 0 (Reinicio)
-    2.Virtio_status = 1 (Acknowledge: O kernel reconhece o dispositivo virtio)
-    3.virtio_status = 2 (Driver: O kernel diz que sabe como controlar o dispositivo)
-    4. (O driver diz as configurações que vai usar para os pacotes, pulado neste kernel)
-    
-
-
-    O driver então verifica se o status é 8 indicando que o dispositivo aceitou as configurções.
-    caso contrario, lança erro
+    1.Virtio_status |= 0 (Reinicio)
+    2.Virtio_status |= 1 (Acknowledge: O kernel reconhece o dispositivo virtio)
+    3.virtio_status |= 2 (Driver: O kernel diz que sabe como controlar o dispositivo)
+    4.O kernel avisa o dispositivo o tamanho da pagina onde ficam os pacotes.
 
     Depois disso, as virtqueues são configuradas
     neste programa, serão configuradas a queue 0 como recebimento RX e queue 1 como transmissão
@@ -356,6 +352,10 @@ int16_t virtio_net_init(void){
         tabela_sockets[i].em_uso = 0;
 
 
+    //para testes, abre um unico socket de id 0 porta 5555
+    sys_socket(5555);
+
+
     //ARP para a rede
     uint8_t mac_broadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     uint8_t meu_ip[4] = {10, 0, 2, 15};
@@ -363,7 +363,8 @@ int16_t virtio_net_init(void){
     // Envia o ARP Reply não-solicitado. 
     // O QEMU vai gravar essa informação na tabela dele.
     virtio_send_arp_reply(mac_broadcast, meu_ip);
-    
+
+    virtiommio_on = 1;
     return 1;
 }
 
@@ -378,7 +379,7 @@ int16_t virtio_net_init(void){
 
 int32_t sys_socket(uint16_t porta){
     for (uint32_t i = 0; i < MAX_SOCKETS; i++)
-        if (!tabela_sockets[i].em_uso){
+        if (!tabela_sockets[i].em_uso || tabela_sockets[i].porta_local == porta){
             tabela_sockets[i].em_uso = 1;
             tabela_sockets[i].porta_local = porta;
             tabela_sockets[i].rx_tamanho = 0;
@@ -391,6 +392,9 @@ int32_t sys_socket(uint16_t porta){
 
 extern struct process *current;
 uint32_t sys_recv(int32_t sock_id, void *buffer_user, uint32_t tam_max){
+    if (virtiommio_on == 0)
+        return 0;
+    
 
 
     volatile uint32_t *mmio_interrupt = (VIRTIO0_BASE + 0x060);
@@ -408,50 +412,19 @@ uint32_t sys_recv(int32_t sock_id, void *buffer_user, uint32_t tam_max){
 
     sock->rx_tamanho = 0;
 
-    return bytes; //retorna quantidade de bytes lidos
-
-    /*
-    
-    volatile struct socket *sock = &tabela_sockets[sock_id];
-    
-    // O socket ouvinte nao tem nenhum pacote ainda
-    //ele sera blockeado
-    
-    while(sock->rx_tamanho == 0){
-            current->state = BLOCKED;
-            current->blocked_by = BT_UART; // Talvez adicionar um BT_NETWORK ?
-            sock->processo_bloqueado = current;
-
-
-            pll_node* pll = pcb_get_node_pid(current->pid);
-            pcb_fall(pll);
-            pcb_elect();
-    }
-    
-
-    uint32_t bytes = (sock->rx_tamanho < tam_max) ? sock->rx_tamanho : tam_max;
-
-    //seria ideal ter uma rotina de memcpy aqui
-    for(uint32_t i=0; i < bytes; i++) 
-        ((uint8_t*)buffer_user)[i] = sock->rx_buffer[i];
-
-    sock->rx_tamanho = 0;
-
-    return bytes; //retorna quantidade de bytes lidos
-    */
-    
+    return bytes; //retorna quantidade de bytes lidos    
 }
 
 
 
 int32_t sys_send(int32_t sock_id, void *buffer_user, uint32_t len) {
-    if (sock_id < 0 || sock_id >= MAX_SOCKETS || !tabela_sockets[sock_id].em_uso) {
+    if (virtiommio_on == 0 || sock_id < 0 || sock_id >= MAX_SOCKETS || !tabela_sockets[sock_id].em_uso) {
         return -1;
     }
 
     struct virtqueue_info *tx = &virtqueues[1];
     
-    // Pega o próximo descritor livre (simplificado para teste)
+    // Pega o próximo descritor livre 
     uint32_t desc_id = tx->avail_idx % VIRTQ_SIZE;
 
     char *tx_buf = (char *) pmm_alloc_block();

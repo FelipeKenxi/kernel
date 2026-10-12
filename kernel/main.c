@@ -58,8 +58,9 @@ void kmain(void) {
     // TESTES DA PLACA DE REDE //
     kputs("Iniciando placa de rede.\n");
     int16_t virtio = virtio_net_init();
-    if(virtio == 1)
+    if(virtio == 1){
         kputs("Placa de rede iniciada.\n");
+    }
     
     else
         kputs("Placa de rede não encontrada, inicie com make run-net!\n");

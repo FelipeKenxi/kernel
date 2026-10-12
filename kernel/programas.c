@@ -33,20 +33,13 @@ void prog_init_idle(int argc, char** argv) {
 void socket_listen(int argc, char** argv){
     (void)argc; (void)argv;
 
-    int s = socket(5555);
-    
 
     char m[65];
-
-    m[0] = 'o';
-    m[1] = 'i';
-    m[2] = '.';
-    m[3] = '\0';
 
 
     volatile unsigned bytes_lidos = 0;
 
-    bytes_lidos = recv(s, m, 40);
+    bytes_lidos = recv(0, m, 40);
 
     if(bytes_lidos > 0){
 

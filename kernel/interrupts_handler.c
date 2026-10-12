@@ -18,7 +18,7 @@ void gic_enable_interrupt(uint32_t irq) {
   if (irq >= MAX_INTERRUPTS) return; // ID inválido
 
   volatile uint32_t* isenabler = (volatile uint32_t*) GICD_ISENABLER;
-  isenabler[irq / 32] = (1 << (irq % 32));
+  isenabler[irq / 32] |= (1 << (irq % 32));
   if (irq >= 32) {
         volatile uint8_t* itargetsr = (volatile uint8_t*) GICD_ITARGETSR_BASE; 
         itargetsr[irq] = 1; // 1 = CPU 0
